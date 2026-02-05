@@ -80,13 +80,51 @@
       return extractText(content);
     };
 
+    // Helper: Reorder all active (unchecked) task lines in a raw note string.
+    // Moves the sorted block to the position of the first active task found.
+    const reorderActiveTasks = (raw) => {
+      if (typeof raw !== 'string') return raw;
+      const lines = raw.split('\n');
+      const activeEntries = [];
+      const activeIndices = [];
+      for (let i = 0; i < lines.length; i++) {
+        if (lines[i].trim().startsWith('- [ ]')) {
+          activeEntries.push(lines[i]);
+          activeIndices.push(i);
+        }
+      }
+      if (activeEntries.length <= 1) return raw;
+
+      const parseStartAt = (line) => {
+        const m = line.match(/"startAt"\s*:\s*(\d+)/);
+        return m ? parseInt(m[1], 10) : Number.POSITIVE_INFINITY;
+      };
+
+      const sorted = activeEntries.slice().sort((a, b) => parseStartAt(a) - parseStartAt(b));
+      const firstIndex = Math.min(...activeIndices);
+
+      const out = [];
+      let inserted = false;
+      for (let i = 0; i < lines.length; i++) {
+        if (i === firstIndex && !inserted) {
+          out.push(...sorted);
+          inserted = true;
+        }
+        if (lines[i].trim().startsWith('- [ ]')) {
+          // skip original active lines (they're in sorted block)
+          continue;
+        }
+        out.push(lines[i]);
+      }
+      return out.join('\n');
+    };
+
     try {
       const contentText = await getNoteText(targetUUID);
       if (!contentText) {
         await app.alert("❌ Could not read Homework note.");
         return;
       }
-
       const lines = contentText.split('\n');
       const tasksCreated = [];
       const linesToRemove = [];
@@ -158,24 +196,25 @@
           }
         }
       }
-
+      // (no-op) postpone reordering until we've computed cleaned content to avoid extra I/O
       // Show results
       const message = tasksCreated.length > 0 
         ? `✅ Created ${tasksCreated.length} tasks:\n\n${tasksCreated.join('\n')}`
         : "⚠️ No homework items found";
       await app.alert(message);
       
-      // Remove processed lines
-      if (linesToRemove.length > 0) {
-        const updatedText = await getNoteText(targetUUID);
-        let cleanedText = updatedText;
-        for (const lineToRemove of linesToRemove) {
-          cleanedText = cleanedText.replace(lineToRemove + '\n', '').replace(lineToRemove, '');
-        }
-        
-        if (cleanedText !== updatedText) {
-          await app.replaceNoteContent({ uuid: targetUUID }, cleanedText);
-        }
+      // Read the current note (so newly-inserted task lines are preserved),
+      // remove the original processed lines, then reorder and write once.
+      const currentText = await getNoteText(targetUUID);
+      const currentLines = currentText.split(/\r?\n/);
+      const removals = new Set(linesToRemove.map(l => l.trim()));
+      const cleanedLines = currentLines.filter(l => !removals.has(l.trim()));
+      const cleanedText = cleanedLines.join('\n');
+
+      // Reorder active tasks on the cleaned text and write back only once if changed
+      const reorderedText = reorderActiveTasks(cleanedText);
+      if (reorderedText !== currentText) {
+        await app.replaceNoteContent({ uuid: targetUUID }, reorderedText);
       }
       
     } catch (error) {
