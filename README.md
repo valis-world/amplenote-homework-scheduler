@@ -1,87 +1,77 @@
 # Amplenote Homework Scheduler
 
-An Amplenote plugin that converts plain text homework notes into scheduled tasks.
+An Amplenote plugin that turns plain-text homework lines into scheduled tasks in the same note.
 
-## What it does
+## What It Does
 
-This plugin scans plain text notes for subject keywords (e.g. `Mathe`, including abbreviations and common misspellings) and automatically creates scheduled tasks in Amplenote.
+Run the plugin from a homework note. It scans each non-task line, detects the subject at the start, creates an Amplenote task, and removes the original plain-text line after the task is created successfully.
 
-The due date is determined by looking up the **next upcoming lesson** for that subject.
-
----
+The task is scheduled for 17:00 on the day before the next lesson for that subject. If that time has already passed, it schedules the task for the current time instead. Existing unchecked scheduled tasks in the note are sorted by their `startAt` timestamp after each run, even when no new homework lines are found.
 
 ## Example
 
-Given the following plain text in a note:
+**Input in a note:**
 
-Deutsch Aufgabe 1  
-Mathe S. 42 Nr. 3  
-Eng Hausaufgabe Vokabeln
+![Input note with homework lines](images/input-note.png)
 
+**Resulting tasks:**
 
-The plugin will:
+![Resulting scheduled tasks](images/resulting-tasks.png)
 
-- Detect the subject from each line (including abbreviations and common misspellings)
-- Normalize the subject to its **formal subject name**
-- Look up the **next upcoming lesson** for that subject
-- Create scheduled tasks in Amplenote
+The exact dates depend on the timetable configured in `amplenote-homework-scheduler.md`.
 
-Resulting tasks (example):
+## Supported Input
 
-- **Deutsch: Aufgabe 1** → due on *next Deutsch lesson*
-- **Mathematik: S. 42 Nr. 3** → due on *next Mathematik lesson*
-- **Englisch: Hausaufgabe Vokabeln** → due on *next Englisch lesson*
+Each homework line should start with a subject name or alias, followed by the homework text.
 
----
+Aliases are intentionally at least three characters long to avoid accidental matches in normal text.
+
+Supported separators:
+
+- `Mathe S. 42`
+- `Mathe: S. 42`
+- `Mathe - S. 42`
+
+Existing task lines such as `- [ ] ...` and checked tasks are skipped.
+
+## Configuration
+
+All configuration currently lives inside the plugin code:
+
+- `timetable`: lesson days per subject, using `1=Mon` through `7=Sun`
+- `subjectAliases`: accepted names and abbreviations for each subject
+- `subjectDurations`: estimated task duration in minutes
+- `HOMEWORK_START_HOUR`: scheduled start hour, currently `17`
+
+To adapt the plugin, edit those objects in `amplenote-homework-scheduler.md`.
+
+The most useful places to edit are the three objects at the top of the plugin code: `timetable`, `subjectAliases`, and `subjectDurations`.
 
 ## Installation
 
-This plugin is distributed as a single Markdown file.
+1. Create a new note in Amplenote.
+2. Open the note's markdown editor.
+3. Paste the full contents of `amplenote-homework-scheduler.md`.
+4. Enable that note as a plugin from Amplenote's plugin settings.
 
-1. Open the file  
-   **`amplenote-homework-scheduler.md`** in this repository.
+Official docs: https://www.amplenote.com/help/developing_amplenote_plugins/plugin_creation
 
-2. Copy **the entire contents** of the file.
+## Usage
 
-3. In Amplenote:
-   - Create a new note
-   - Open the **three-dots menu (⋮)** in the top right
-   - Select **“Edit Markdown”**
-   - Paste the copied content
-   - Save the note
+1. Open the note containing homework lines.
+2. Go to a new line and run /home-work-scheduler
+3. Review the result alert.
 
-4. Activate the plugin by following the **official Amplenote plugin documentation**:  
-   https://www.amplenote.com/help/plugins
+The plugin uses the note where it was invoked. It does not require a hardcoded homework note UUID.
 
----
+## Current Limitations
 
-## Current state
+- The timetable is hardcoded.
+- It does not sync from WebUntis or Google Calendar yet.
+- Fuzzy subject matching is intentionally simple and may still need tuning.
 
-- Subject recognition with abbreviations and fuzzy matching
-- Hardcoded timetable for lesson lookup
-- Automatic task creation from plain text notes
+## Planned Improvements
 
----
-
-## Planned features
-
-- Integration with WebUntis (via an existing Google Calendar sync)
-- Dynamic timetable lookup instead of hardcoded data
-- Full integration using the Amplenote Plugin API
-
----
-
-## Use case
-
-Built primarily for managing school homework, but can be adapted for any subject-based scheduling workflow.
-
----
-
-## Status
-
-🚧 Work in progress  
-Expect breaking changes as WebUntis and Amplenote API integration is added.
-
----
-
-Feel free to open issues or contribute ideas!
+- Dynamic timetable lookup from an external source.
+- Optional settings for timetable and default task time.
+- More robust tests around subject matching and date calculation.
