@@ -1,3 +1,7 @@
 name = "amplenote-calendar-proxy"
 main = "cloudflare_worker_calendar_proxy.js"
 compatibility_date = "2026-05-23"
+
+[observability.logs]
+enabled = true
+invocation_logs = true
