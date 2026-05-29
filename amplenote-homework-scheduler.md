@@ -14,6 +14,7 @@
     const LOOKAHEAD_DAYS = 35;
     const HOMEWORK_START_HOUR = 17;
     const HOMEWORK_START_MINUTE = 0;
+    const CALENDAR_CACHE_TTL_MS = 5 * 60 * 1000;
 
     // Day numbers: 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat, 7=Sun
     const timetable = {
@@ -81,9 +82,7 @@
         .replace(/\s+/g, "");
     };
 
-    const charSimilarity = (a, b, allowSubstring = true) => {
-      a = normalizeMatchText(a);
-      b = normalizeMatchText(b);
+    const charSimilarityNormalized = (a, b, allowSubstring = true) => {
       if (!a || !b) return 0;
       if (a === b) return 1.0;
       if (Math.min(a.length, b.length) < 3) return 0;
@@ -125,20 +124,71 @@
       return [cleaned, ...pieces, ...words, ...pairs];
     };
 
+    const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+    const SUBJECT_FORMS = Object.entries(subjectAliases)
+      .flatMap(([subject, aliases]) => [subject, ...aliases].map(form => ({ subject, form })))
+      .sort((a, b) => b.form.length - a.form.length);
+
+    const NORMALIZED_SUBJECT_FORMS = SUBJECT_FORMS.map(({ subject, form }) => ({
+      subject,
+      normalized: normalizeMatchText(form),
+    }));
+
+    const NORMALIZED_SUBJECT_FORMS_BY_SUBJECT = Object.entries(subjectAliases).reduce((out, [subject, aliases]) => {
+      out[subject] = [subject, ...aliases].map(form => ({ subject, normalized: normalizeMatchText(form) }));
+      return out;
+    }, {});
+
+    const HOMEWORK_PREFIX_PATTERNS = SUBJECT_FORMS.map(({ subject, form }) => ({
+      subject,
+      pattern: new RegExp(`^${escapeRegExp(form).replace(/\s+/g, "\\s+")}(?=$|\\s|\\s*[:\\-])`, "i"),
+    }));
+
     const MATCH_THRESHOLD = 0.70;
+    const formatPercent = (score) => {
+      return typeof score === "number" ? `${Math.round(score * 100)}%` : "n/a";
+    };
+
+    const clockNow = () => {
+      return typeof performance !== "undefined" && performance.now ? performance.now() : Date.now();
+    };
+
+    const formatDuration = (ms) => {
+      if (typeof ms !== "number") return "n/a";
+      if (ms < 1000) return `${Math.round(ms)}ms`;
+      return `${(ms / 1000).toFixed(ms < 10000 ? 2 : 1)}s`;
+    };
+
     const bestSubjectMatch = (candidates, options = {}) => {
       const allowSubstring = options.allowSubstring !== false;
+      const forms = options.subjects
+        ? Array.from(options.subjects).flatMap(subject => NORMALIZED_SUBJECT_FORMS_BY_SUBJECT[subject] || [])
+        : NORMALIZED_SUBJECT_FORMS;
       let best = null;
       let bestScore = 0;
       for (const candidate of candidates) {
-        for (const [subject, aliases] of Object.entries(subjectAliases)) {
-          for (const form of [subject, ...aliases]) {
-            const score = charSimilarity(candidate, form, allowSubstring);
-            if (score > bestScore) { bestScore = score; best = subject; }
-          }
+        const normalizedCandidate = normalizeMatchText(candidate);
+        if (!normalizedCandidate) continue;
+        for (const { subject, normalized } of forms) {
+          const score = charSimilarityNormalized(normalizedCandidate, normalized, allowSubstring);
+          if (score > bestScore) { bestScore = score; best = subject; }
         }
       }
       return bestScore >= MATCH_THRESHOLD ? { subject: best, score: bestScore } : null;
+    };
+
+    const quickSubjectMatch = (normalizedText, subjects = null) => {
+      if (!normalizedText) return null;
+      const forms = subjects
+        ? Array.from(subjects).flatMap(subject => NORMALIZED_SUBJECT_FORMS_BY_SUBJECT[subject] || [])
+        : NORMALIZED_SUBJECT_FORMS;
+      for (const { subject, normalized } of forms) {
+        if (normalized.length < 3) continue;
+        if (normalizedText === normalized) return { subject, score: 1.0 };
+        if (normalizedText.includes(normalized)) return { subject, score: 0.92 };
+      }
+      return null;
     };
 
     const matchHomeworkSubject = (line) => {
@@ -146,34 +196,24 @@
       return token ? bestSubjectMatch([token], { allowSubstring: false }) : null;
     };
 
-    const matchCalendarSubject = (summary, description = "") => bestSubjectMatch(calendarCandidates(summary, description));
-
-    const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-    const subjectForms = () => {
-      const forms = [];
-      for (const [subject, aliases] of Object.entries(subjectAliases)) {
-        for (const form of [subject, ...aliases]) forms.push({ subject, form });
-      }
-      return forms.sort((a, b) => b.form.length - a.form.length);
+    const matchCalendarSubject = (summary, description = "", subjects = null) => {
+      return bestSubjectMatch(calendarCandidates(summary, description), { subjects });
     };
 
     const parseHomeworkLine = (line) => {
       const trimmed = line.trim();
-      for (const { subject, form } of subjectForms()) {
-        const patternText = escapeRegExp(form).replace(/\s+/g, "\\s+");
-        const pattern = new RegExp(`^${patternText}(?=$|\\s|\\s*[:\\-])`, "i");
+      for (const { subject, pattern } of HOMEWORK_PREFIX_PATTERNS) {
         const prefix = trimmed.match(pattern);
         if (!prefix) continue;
         const homework = trimmed.slice(prefix[0].length).replace(/^[: -]+/, "").trim();
-        if (homework) return { subject, homework };
+        if (homework) return { subject, homework, subjectScore: 1.0 };
       }
 
       const match = matchHomeworkSubject(trimmed);
       if (!match) return null;
       const token = extractToken(trimmed);
       const homework = trimmed.slice(token.length).replace(/^[: -]+/, "").trim();
-      return homework ? { subject: match.subject, homework } : null;
+      return homework ? { subject: match.subject, homework, subjectScore: match.score } : null;
     };
 
     const extractText = (node) => {
@@ -272,12 +312,45 @@
 
     const normalizeProxyUrl = (url) => String(url || "").trim();
 
+    const calendarTextCache = () => {
+      if (typeof globalThis === "undefined") return null;
+      if (!globalThis.__amplenoteHomeworkCalendarCache) globalThis.__amplenoteHomeworkCalendarCache = {};
+      return globalThis.__amplenoteHomeworkCalendarCache;
+    };
+
+    const calendarParseCache = () => {
+      if (typeof globalThis === "undefined") return null;
+      if (!globalThis.__amplenoteHomeworkParsedCalendarCache) globalThis.__amplenoteHomeworkParsedCalendarCache = {};
+      return globalThis.__amplenoteHomeworkParsedCalendarCache;
+    };
+
+    const calendarLessonCache = () => {
+      if (typeof globalThis === "undefined") return null;
+      if (!globalThis.__amplenoteHomeworkLessonCache) globalThis.__amplenoteHomeworkLessonCache = {};
+      return globalThis.__amplenoteHomeworkLessonCache;
+    };
+
+    const icsCacheKey = (icsText) => {
+      const text = String(icsText || "");
+      return `${text.length}:${text.slice(0, 200)}:${text.slice(-200)}`;
+    };
+
+    const calendarLessonCacheKey = (icsText, subjects, now) => {
+      const subjectKey = Array.from(subjects || []).sort().join("|");
+      const timeBucket = Math.floor(now.getTime() / CALENDAR_CACHE_TTL_MS);
+      return `${icsCacheKey(icsText)}:${subjectKey}:${timeBucket}`;
+    };
+
     const fetchCalendarText = async (url, token) => {
       const normalized = normalizeProxyUrl(url);
       const accessToken = String(token || "").trim();
       if (!normalized) throw new Error(`No "${CALENDAR_PROXY_URL_SETTING_NAME}" setting configured`);
       if (!accessToken) throw new Error(`No "${CALENDAR_PROXY_TOKEN_SETTING_NAME}" setting configured`);
       const authorization = accessToken.toLowerCase().startsWith("bearer ") ? accessToken : `Bearer ${accessToken}`;
+      const cache = calendarTextCache();
+      const cacheKey = `${normalized}\n${accessToken}`;
+      const cached = cache && cache[cacheKey];
+      if (cached && cached.body && Date.now() - cached.fetchedAt < CALENDAR_CACHE_TTL_MS) return cached.body;
 
       const response = await fetch(normalized, {
         headers: {
@@ -298,6 +371,7 @@
 
       const text = await response.text();
       if (!text.includes("BEGIN:VCALENDAR")) throw new Error("Calendar proxy did not return an ICS calendar");
+      if (cache) cache[cacheKey] = { body: text, fetchedAt: Date.now() };
       return text;
     };
 
@@ -314,6 +388,19 @@
       }
       return params;
     };
+
+    const USED_ICS_PROPERTIES = new Set([
+      "DESCRIPTION",
+      "DTEND",
+      "DTSTART",
+      "EXDATE",
+      "RECURRENCE-ID",
+      "RRULE",
+      "STATUS",
+      "SUMMARY",
+      "TRANSP",
+      "UID",
+    ]);
 
     const parseIcsEvents = (icsText) => {
       const events = [];
@@ -334,14 +421,26 @@
         if (colon === -1) continue;
         const nameParts = line.slice(0, colon).split(";");
         const name = nameParts[0].toUpperCase();
+        if (!USED_ICS_PROPERTIES.has(name)) continue;
         const prop = {
           name,
-          params: parseParams(nameParts.slice(1)),
+          params: nameParts.length > 1 ? parseParams(nameParts.slice(1)) : {},
           value: line.slice(colon + 1),
         };
         if (!current[name]) current[name] = [];
         current[name].push(prop);
       }
+      return events;
+    };
+
+    const parseCachedIcsEvents = (icsText) => {
+      const cache = calendarParseCache();
+      if (!cache) return parseIcsEvents(icsText);
+      const key = icsCacheKey(icsText);
+      const cached = cache[key];
+      if (cached) return cached;
+      const events = parseIcsEvents(icsText);
+      cache[key] = events;
       return events;
     };
 
@@ -430,41 +529,75 @@
     };
 
     const eventText = (event) => {
-      return {
+      if (event._text) return event._text;
+      event._text = {
         summary: unescapeIcsText(propValue(firstProp(event, "SUMMARY"))),
         description: unescapeIcsText(propValue(firstProp(event, "DESCRIPTION"))),
       };
+      return event._text;
+    };
+
+    const eventMatchText = (event) => {
+      if (event._matchText) return event._matchText;
+      const { summary, description } = eventText(event);
+      event._matchText = normalizeMatchText(`${summary}\n${stripHtml(description)}`);
+      return event._matchText;
+    };
+
+    const subjectMatchCacheKey = (subjects) => {
+      return subjects ? Array.from(subjects).sort().join("|") : "*";
+    };
+
+    const eventSubjectMatch = (event, subjects = null) => {
+      if (!event._subjectMatches) event._subjectMatches = {};
+      const key = subjectMatchCacheKey(subjects);
+      if (Object.prototype.hasOwnProperty.call(event._subjectMatches, key)) return event._subjectMatches[key];
+      const { summary, description } = eventText(event);
+      const match = quickSubjectMatch(eventMatchText(event), subjects) || matchCalendarSubject(summary, description, subjects);
+      event._subjectMatches[key] = match;
+      return event._subjectMatches[key];
     };
 
     const eventSubject = (event) => {
-      const { summary, description } = eventText(event);
-      const match = matchCalendarSubject(summary, description);
+      const match = eventSubjectMatch(event);
       return match ? match.subject : null;
     };
 
     const eventTimeRange = (event) => {
+      if (Object.prototype.hasOwnProperty.call(event, "_timeRange")) return event._timeRange;
       const dtStartProp = firstProp(event, "DTSTART");
-      if (!dtStartProp || dtStartProp.params.VALUE === "DATE") return null;
+      if (!dtStartProp || dtStartProp.params.VALUE === "DATE") {
+        event._timeRange = null;
+        return event._timeRange;
+      }
       const start = parseIcsDate(propValue(dtStartProp), propParams(dtStartProp));
-      if (!start) return null;
+      if (!start) {
+        event._timeRange = null;
+        return event._timeRange;
+      }
 
       const dtEndProp = firstProp(event, "DTEND");
       const end = parseIcsDate(propValue(dtEndProp), propParams(dtEndProp));
-      return {
+      event._timeRange = {
         start,
         end: end && end > start ? end : new Date(start.getTime() + 45 * 60 * 1000),
       };
+      return event._timeRange;
     };
 
     const isCancellationEvent = (event) => {
+      if (Object.prototype.hasOwnProperty.call(event, "_isCancellation")) return event._isCancellation;
       const status = propValue(firstProp(event, "STATUS")).toUpperCase();
       const { summary, description } = eventText(event);
-      return status === "CANCELLED" || /\[(?:X|x)\]/.test(summary) || /<b>\s*CANCELLED\s*\[X\]\s*<\/b>/i.test(description);
+      event._isCancellation = status === "CANCELLED" || /\[(?:X|x)\]/.test(summary) || /<b>\s*CANCELLED\s*\[X\]\s*<\/b>/i.test(description);
+      return event._isCancellation;
     };
 
     const isUpdateEvent = (event) => {
+      if (Object.prototype.hasOwnProperty.call(event, "_isUpdate")) return event._isUpdate;
       const { summary, description } = eventText(event);
-      return /\[\+\]/.test(summary) || /<b>\s*UPDATED\s*\[\+\]\s*<\/b>/i.test(description);
+      event._isUpdate = /\[\+\]/.test(summary) || /<b>\s*UPDATED\s*\[\+\]\s*<\/b>/i.test(description);
+      return event._isUpdate;
     };
 
     const rangesOverlap = (aStart, aEnd, bStart, bEnd) => aStart < bEnd && bStart < aEnd;
@@ -514,17 +647,17 @@
       return false;
     };
 
-    const addOccurrence = (occurrences, event, start, end, excludedDays, excludedTimes, windowStart, windowEnd, blocks) => {
+    const addOccurrence = (occurrences, event, start, end, excludedDays, excludedTimes, windowStart, windowEnd, blocks, wantedSubjects) => {
       if (!start || start < windowStart || start > windowEnd) return;
       if (excludedTimes.has(start.getTime()) || excludedDays.has(dayKey(start))) return;
-      const { summary, description } = eventText(event);
-      const match = matchCalendarSubject(summary, description);
-      if (!match) return;
-      if (isBlockedByWebUntisChange(match.subject, start, end, blocks)) return;
-      occurrences.push({ subject: match.subject, summary, start, end });
+      const match = eventSubjectMatch(event, wantedSubjects);
+      const subject = match && match.subject;
+      if (!subject || (wantedSubjects && !wantedSubjects.has(subject))) return;
+      if (isBlockedByWebUntisChange(subject, start, end, blocks)) return;
+      occurrences.push({ subject, subjectScore: match.score, summary: eventText(event).summary, start, end });
     };
 
-    const expandCalendarEvents = (events, now, lookaheadDays) => {
+    const expandCalendarEvents = (events, now, lookaheadDays, wantedSubjects = null) => {
       const windowStart = new Date(now);
       const windowEnd = addDays(now, lookaheadDays);
       const occurrences = [];
@@ -537,6 +670,10 @@
 
       for (const event of events) {
         if (isCancelledOrNonLesson(event)) continue;
+
+        const subjectMatch = eventSubjectMatch(event, wantedSubjects);
+        const subject = subjectMatch && subjectMatch.subject;
+        if (!subject || (wantedSubjects && !wantedSubjects.has(subject))) continue;
 
         const dtStartProp = firstProp(event, "DTSTART");
         const dtStart = parseIcsDate(propValue(dtStartProp), propParams(dtStartProp));
@@ -552,7 +689,7 @@
         const rruleProp = firstProp(event, "RRULE");
 
         if (!rruleProp) {
-          addOccurrence(occurrences, event, dtStart, new Date(dtStart.getTime() + durationMs), excludedDays, excludedTimes, windowStart, windowEnd, blocks);
+          addOccurrence(occurrences, event, dtStart, new Date(dtStart.getTime() + durationMs), excludedDays, excludedTimes, windowStart, windowEnd, blocks, wantedSubjects);
           continue;
         }
 
@@ -593,7 +730,8 @@
               excludedTimes,
               windowStart,
               maxEnd,
-              blocks
+              blocks,
+              wantedSubjects
             );
           }
         }
@@ -602,8 +740,21 @@
       return occurrences.sort((a, b) => a.start - b.start);
     };
 
-    const findNextCalendarLesson = (subject, occurrences, now) => {
-      return occurrences.find(occurrence => occurrence.subject === subject && occurrence.start > now) || null;
+    const indexNextCalendarLessons = (occurrences, now) => {
+      const lessons = new Map();
+      for (const occurrence of occurrences) {
+        if (occurrence.start <= now || lessons.has(occurrence.subject)) continue;
+        lessons.set(occurrence.subject, occurrence);
+      }
+      return lessons;
+    };
+
+    const cachedCalendarLessonsAreFresh = (lessons, now) => {
+      if (!lessons || typeof lessons.values !== "function") return false;
+      for (const lesson of lessons.values()) {
+        if (!lesson || !lesson.start || lesson.start <= now) return false;
+      }
+      return true;
     };
 
     const nextTimetableLessonStart = (subject, today) => {
@@ -650,11 +801,12 @@
       });
     };
 
-    const sourceLabel = (source) => source === "calendar" ? "📅 calendar" : "🗓️ timetable";
-
     try {
+      const runStartedAt = clockNow();
       const targetUUID = app.context.noteUUID;
+      const noteReadStartedAt = clockNow();
       const contentText = await getNoteText(targetUUID);
+      const noteReadMs = clockNow() - noteReadStartedAt;
       if (!contentText) { await app.alert("❌ Could not read note."); return; }
 
       const homeworkItems = [];
@@ -667,16 +819,21 @@
         const homeworkItem = parseHomeworkLine(trimmed);
         if (!homeworkItem) continue;
 
-        homeworkItems.push({ line, subject: homeworkItem.subject, homework: homeworkItem.homework });
+        homeworkItems.push({
+          line,
+          subject: homeworkItem.subject,
+          homework: homeworkItem.homework,
+          subjectScore: homeworkItem.subjectScore,
+        });
       }
 
       if (homeworkItems.length === 0) {
         const reorderedText = reorderActiveTasks(contentText);
         if (reorderedText !== contentText) {
           await app.replaceNoteContent({ uuid: targetUUID }, reorderedText);
-          await app.alert("ℹ️ No homework items found.\n\n✅ Reordered existing scheduled tasks.");
+          await app.alert("🔎 No homework items found.\n\nReordered existing scheduled tasks.");
         } else {
-          await app.alert("ℹ️ No homework items found.");
+          await app.alert("🔎 No homework items found.");
         }
         return;
       }
@@ -686,27 +843,62 @@
       const fallbackSubjects = new Set();
       const tasksCreated = [];
       const linesToRemove = [];
-      let calendarOccurrences = [];
+      const wantedSubjects = new Set(homeworkItems.map(item => item.subject));
+      const stats = {
+        noteReadMs,
+        calendarFetchMs: null,
+        calendarParseExpandMs: null,
+        calendarEvents: 0,
+        calendarOccurrences: 0,
+        calendarComputeCacheHit: false,
+      };
+      let calendarLessons = new Map();
       let calendarAvailable = false;
 
       try {
         const proxyUrl = app.settings && app.settings[CALENDAR_PROXY_URL_SETTING_NAME];
         const proxyToken = app.settings && app.settings[CALENDAR_PROXY_TOKEN_SETTING_NAME];
+        const calendarFetchStartedAt = clockNow();
         const icsText = await fetchCalendarText(proxyUrl, proxyToken);
-        calendarOccurrences = expandCalendarEvents(parseIcsEvents(icsText), now, LOOKAHEAD_DAYS);
+        stats.calendarFetchMs = clockNow() - calendarFetchStartedAt;
+        const calendarParseStartedAt = clockNow();
+        const lessonCache = calendarLessonCache();
+        const lessonCacheKey = calendarLessonCacheKey(icsText, wantedSubjects, now);
+        const cachedLessonData = lessonCache && lessonCache[lessonCacheKey];
+        if (cachedLessonData && cachedCalendarLessonsAreFresh(cachedLessonData.lessons, now)) {
+          calendarLessons = cachedLessonData.lessons;
+          stats.calendarEvents = cachedLessonData.calendarEvents;
+          stats.calendarOccurrences = cachedLessonData.calendarOccurrences;
+          stats.calendarComputeCacheHit = true;
+        } else {
+          const calendarEvents = parseCachedIcsEvents(icsText);
+          const calendarOccurrences = expandCalendarEvents(calendarEvents, now, LOOKAHEAD_DAYS, wantedSubjects);
+          calendarLessons = indexNextCalendarLessons(calendarOccurrences, now);
+          stats.calendarEvents = calendarEvents.length;
+          stats.calendarOccurrences = calendarOccurrences.length;
+          if (lessonCache) {
+            lessonCache[lessonCacheKey] = {
+              lessons: calendarLessons,
+              calendarEvents: stats.calendarEvents,
+              calendarOccurrences: stats.calendarOccurrences,
+            };
+          }
+        }
+        stats.calendarParseExpandMs = clockNow() - calendarParseStartedAt;
         calendarAvailable = true;
       } catch (err) {
         const origin = typeof window !== "undefined" && window.location ? window.location.origin : "unknown origin";
-        warnings.push(`⚠️ Calendar proxy warning from ${origin}: ${err.message}. Using timetable fallback where possible.`);
+        warnings.push(`Calendar proxy warning from ${origin}: ${err.message}. Using timetable fallback where possible.`);
       }
 
       for (const item of homeworkItems) {
         const { line, subject, homework } = item;
         let lessonStart = null;
         let source = "timetable";
+        let calendarLesson = null;
 
         if (calendarAvailable) {
-          const calendarLesson = findNextCalendarLesson(subject, calendarOccurrences, now);
+          calendarLesson = calendarLessons.get(subject);
           if (calendarLesson) {
             lessonStart = calendarLesson.start;
             source = "calendar";
@@ -717,7 +909,7 @@
 
         if (!lessonStart) lessonStart = nextTimetableLessonStart(subject, now);
         if (!lessonStart) {
-          warnings.push(`⚠️ No timetable fallback exists for ${subject}; skipped "${homework}".`);
+          warnings.push(`No timetable fallback exists for ${subject}; skipped "${homework}".`);
           continue;
         }
 
@@ -728,24 +920,35 @@
 
         try {
           await app.insertTask({ uuid: targetUUID }, { content: `${subject}: ${homework}`, startAt, endAt });
-          tasksCreated.push(`✅ ${subject}: ${homework} (${duration}m, ${sourceLabel(source)}, due ${formatDateTime(taskDate)})`);
+          const lessonScore = source === "calendar" && calendarLesson ? formatPercent(calendarLesson.subjectScore) : "--";
+          const fallbackMarker = source === "timetable" ? " · fallback" : "";
+          tasksCreated.push(`- ${subject}: ${homework} · ${formatDateTime(taskDate)} · ${duration}m · ${formatPercent(item.subjectScore)}/${lessonScore}${fallbackMarker}`);
           linesToRemove.push(line);
         } catch (err) {
           console.error(`Failed to create task for ${subject}:`, err);
-          warnings.push(`❌ Failed to create ${subject} task: ${err.message}`);
+          warnings.push(`Failed to create ${subject} task: ${err.message}`);
         }
       }
 
       if (fallbackSubjects.size > 0) {
-        warnings.push(`⚠️ No matching calendar lesson found for: ${sortMessages([...fallbackSubjects]).join(", ")}. Used timetable fallback.`);
+        warnings.push(`No matching calendar lesson found for: ${sortMessages([...fallbackSubjects]).join(", ")}. Used timetable fallback.`);
       }
 
       const summaryParts = [];
       if (tasksCreated.length > 0) {
         summaryParts.push(`✅ Created ${tasksCreated.length} task(s):\n\n${tasksCreated.join("\n")}`);
       } else {
-        summaryParts.push("ℹ️ No tasks were created.");
+        summaryParts.push("🔎 No tasks were created.");
       }
+      const totalMs = clockNow() - runStartedAt;
+      let statsText = `${formatDuration(totalMs)} total`;
+      if (calendarAvailable) {
+        const computeLabel = stats.calendarComputeCacheHit ? "cached" : formatDuration(stats.calendarParseExpandMs);
+        statsText += ` | cal ${formatDuration(stats.calendarFetchMs)} + ${computeLabel} | ${stats.calendarEvents}→${stats.calendarOccurrences}`;
+      } else {
+        statsText += " | calendar fallback";
+      }
+      summaryParts.push(`📊 Stats: ${statsText}`);
       if (warnings.length > 0) summaryParts.push(`⚠️ Warnings:\n${warnings.join("\n")}`);
       await app.alert(summaryParts.join("\n\n"));
 

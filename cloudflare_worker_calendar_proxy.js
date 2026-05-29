@@ -21,6 +21,9 @@ function textResponse(request, body, status = 200, extraHeaders = {}) {
   });
 }
 
+const CACHE_TTL_MS = 5 * 60 * 1000;
+let calendarCache = null;
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") {
@@ -48,6 +51,16 @@ export default {
       return textResponse(request, "Unauthorized", 401);
     }
 
+    const now = Date.now();
+    const forceRefresh = new URL(request.url).searchParams.get("refresh") === "1";
+    if (!forceRefresh && calendarCache && calendarCache.url === calendarUrl && now - calendarCache.fetchedAt < CACHE_TTL_MS) {
+      return textResponse(request, calendarCache.body, 200, {
+        "Content-Type": "text/calendar; charset=utf-8",
+        "Cache-Control": "private, max-age=300",
+        "X-Calendar-Cache": "HIT",
+      });
+    }
+
     let calendarResponse;
     try {
       calendarResponse = await fetch(calendarUrl, {
@@ -68,9 +81,16 @@ export default {
       return textResponse(request, "Calendar response was not ICS", 502);
     }
 
+    calendarCache = {
+      url: calendarUrl,
+      body: icsText,
+      fetchedAt: now,
+    };
+
     return textResponse(request, icsText, 200, {
       "Content-Type": "text/calendar; charset=utf-8",
-      "Cache-Control": "no-store",
+      "Cache-Control": "private, max-age=300",
+      "X-Calendar-Cache": "MISS",
     });
   },
 };
