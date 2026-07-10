@@ -49,10 +49,28 @@ The Worker should:
 
 - Store the private Google Calendar ICS URL as a Cloudflare secret named `ICS_URL`.
 - Store a random bearer token as a Cloudflare secret named `ACCESS_TOKEN`.
+- Use a Workers KV binding named `CALENDAR_CACHE` to store the latest valid ICS snapshot.
+- Run its configured four-minute Cron Trigger to refresh that snapshot before a plugin run needs it.
 - Require `Authorization: Bearer <token>`.
 - Return the ICS calendar with browser CORS headers.
 
 Use `cloudflare_worker_calendar_proxy.js` as the Worker implementation.
+
+### KV setup
+
+Create a KV namespace, then add the ID printed by Wrangler to `wrangler.toml`:
+
+```powershell
+npx wrangler kv namespace create CALENDAR_CACHE
+```
+
+```toml
+[[kv_namespaces]]
+binding = "CALENDAR_CACHE"
+id = "<namespace-id-from-wrangler>"
+```
+
+The Worker refreshes this snapshot every four minutes. A plugin request uses it only while it is at most five minutes old; an expired or missing snapshot is refreshed before it is returned. If Google cannot be refreshed then, the plugin uses its existing timetable fallback rather than stale calendar data.
 
 ## Plugin Settings
 
@@ -97,6 +115,7 @@ The script checks the browser-style CORS preflight and then fetches the calendar
 - `Access-Control-Allow-Headers` including `Authorization`
 - `Status: 200` for the calendar fetch
 - `Looks like ICS: yes`
+- `X-Calendar-Cache: HIT` after a scheduled refresh, or `MISS` when the request had to refresh it itself
 
 ## Configuration In Code
 

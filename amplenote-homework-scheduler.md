@@ -14,7 +14,6 @@
     const LOOKAHEAD_DAYS = 35;
     const HOMEWORK_START_HOUR = 17;
     const HOMEWORK_START_MINUTE = 0;
-    const CALENDAR_CACHE_TTL_MS = 5 * 60 * 1000;
 
     // Day numbers: 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat, 7=Sun
     const timetable = {
@@ -312,33 +311,15 @@
 
     const normalizeProxyUrl = (url) => String(url || "").trim();
 
-    const calendarTextCache = () => {
-      if (typeof globalThis === "undefined") return null;
-      if (!globalThis.__amplenoteHomeworkCalendarCache) globalThis.__amplenoteHomeworkCalendarCache = {};
-      return globalThis.__amplenoteHomeworkCalendarCache;
-    };
-
     const calendarParseCache = () => {
       if (typeof globalThis === "undefined") return null;
       if (!globalThis.__amplenoteHomeworkParsedCalendarCache) globalThis.__amplenoteHomeworkParsedCalendarCache = {};
       return globalThis.__amplenoteHomeworkParsedCalendarCache;
     };
 
-    const calendarLessonCache = () => {
-      if (typeof globalThis === "undefined") return null;
-      if (!globalThis.__amplenoteHomeworkLessonCache) globalThis.__amplenoteHomeworkLessonCache = {};
-      return globalThis.__amplenoteHomeworkLessonCache;
-    };
-
     const icsCacheKey = (icsText) => {
       const text = String(icsText || "");
       return `${text.length}:${text.slice(0, 200)}:${text.slice(-200)}`;
-    };
-
-    const calendarLessonCacheKey = (icsText, subjects, now) => {
-      const subjectKey = Array.from(subjects || []).sort().join("|");
-      const timeBucket = Math.floor(now.getTime() / CALENDAR_CACHE_TTL_MS);
-      return `${icsCacheKey(icsText)}:${subjectKey}:${timeBucket}`;
     };
 
     const fetchCalendarText = async (url, token) => {
@@ -347,11 +328,6 @@
       if (!normalized) throw new Error(`No "${CALENDAR_PROXY_URL_SETTING_NAME}" setting configured`);
       if (!accessToken) throw new Error(`No "${CALENDAR_PROXY_TOKEN_SETTING_NAME}" setting configured`);
       const authorization = accessToken.toLowerCase().startsWith("bearer ") ? accessToken : `Bearer ${accessToken}`;
-      const cache = calendarTextCache();
-      const cacheKey = `${normalized}\n${accessToken}`;
-      const cached = cache && cache[cacheKey];
-      if (cached && cached.body && Date.now() - cached.fetchedAt < CALENDAR_CACHE_TTL_MS) return cached.body;
-
       const response = await fetch(normalized, {
         headers: {
           Authorization: authorization,
@@ -371,8 +347,14 @@
 
       const text = await response.text();
       if (!text.includes("BEGIN:VCALENDAR")) throw new Error("Calendar proxy did not return an ICS calendar");
-      if (cache) cache[cacheKey] = { body: text, fetchedAt: Date.now() };
-      return text;
+      const fetchedAt = parseInt(response.headers.get("X-Calendar-Fetched-At") || "", 10);
+      const refreshMs = parseInt(response.headers.get("X-Calendar-Refresh-Ms") || "", 10);
+      return {
+        text,
+        cacheStatus: response.headers.get("X-Calendar-Cache") || "unknown",
+        fetchedAt: Number.isFinite(fetchedAt) ? fetchedAt : null,
+        refreshMs: Number.isFinite(refreshMs) ? refreshMs : null,
+      };
     };
 
     const unfoldIcsLines = (icsText) => {
@@ -749,14 +731,6 @@
       return lessons;
     };
 
-    const cachedCalendarLessonsAreFresh = (lessons, now) => {
-      if (!lessons || typeof lessons.values !== "function") return false;
-      for (const lesson of lessons.values()) {
-        if (!lesson || !lesson.start || lesson.start <= now) return false;
-      }
-      return true;
-    };
-
     const nextTimetableLessonStart = (subject, today) => {
       const lessonDays = timetable[subject];
       if (!lessonDays || lessonDays.length === 0) return null;
@@ -850,7 +824,9 @@
         calendarParseExpandMs: null,
         calendarEvents: 0,
         calendarOccurrences: 0,
-        calendarComputeCacheHit: false,
+        calendarCacheStatus: "unknown",
+        calendarSnapshotAgeMs: null,
+        calendarRefreshMs: null,
       };
       let calendarLessons = new Map();
       let calendarAvailable = false;
@@ -859,31 +835,17 @@
         const proxyUrl = app.settings && app.settings[CALENDAR_PROXY_URL_SETTING_NAME];
         const proxyToken = app.settings && app.settings[CALENDAR_PROXY_TOKEN_SETTING_NAME];
         const calendarFetchStartedAt = clockNow();
-        const icsText = await fetchCalendarText(proxyUrl, proxyToken);
+        const calendarFetch = await fetchCalendarText(proxyUrl, proxyToken);
         stats.calendarFetchMs = clockNow() - calendarFetchStartedAt;
+        stats.calendarCacheStatus = calendarFetch.cacheStatus;
+        stats.calendarRefreshMs = calendarFetch.refreshMs;
+        stats.calendarSnapshotAgeMs = calendarFetch.fetchedAt === null ? null : Math.max(0, Date.now() - calendarFetch.fetchedAt);
         const calendarParseStartedAt = clockNow();
-        const lessonCache = calendarLessonCache();
-        const lessonCacheKey = calendarLessonCacheKey(icsText, wantedSubjects, now);
-        const cachedLessonData = lessonCache && lessonCache[lessonCacheKey];
-        if (cachedLessonData && cachedCalendarLessonsAreFresh(cachedLessonData.lessons, now)) {
-          calendarLessons = cachedLessonData.lessons;
-          stats.calendarEvents = cachedLessonData.calendarEvents;
-          stats.calendarOccurrences = cachedLessonData.calendarOccurrences;
-          stats.calendarComputeCacheHit = true;
-        } else {
-          const calendarEvents = parseCachedIcsEvents(icsText);
-          const calendarOccurrences = expandCalendarEvents(calendarEvents, now, LOOKAHEAD_DAYS, wantedSubjects);
-          calendarLessons = indexNextCalendarLessons(calendarOccurrences, now);
-          stats.calendarEvents = calendarEvents.length;
-          stats.calendarOccurrences = calendarOccurrences.length;
-          if (lessonCache) {
-            lessonCache[lessonCacheKey] = {
-              lessons: calendarLessons,
-              calendarEvents: stats.calendarEvents,
-              calendarOccurrences: stats.calendarOccurrences,
-            };
-          }
-        }
+        const calendarEvents = parseCachedIcsEvents(calendarFetch.text);
+        const calendarOccurrences = expandCalendarEvents(calendarEvents, now, LOOKAHEAD_DAYS, wantedSubjects);
+        calendarLessons = indexNextCalendarLessons(calendarOccurrences, now);
+        stats.calendarEvents = calendarEvents.length;
+        stats.calendarOccurrences = calendarOccurrences.length;
         stats.calendarParseExpandMs = clockNow() - calendarParseStartedAt;
         calendarAvailable = true;
       } catch (err) {
@@ -943,8 +905,9 @@
       const totalMs = clockNow() - runStartedAt;
       let statsText = `${formatDuration(totalMs)} total`;
       if (calendarAvailable) {
-        const computeLabel = stats.calendarComputeCacheHit ? "cached" : formatDuration(stats.calendarParseExpandMs);
-        statsText += ` | cal ${formatDuration(stats.calendarFetchMs)} + ${computeLabel} | ${stats.calendarEvents}→${stats.calendarOccurrences}`;
+        const snapshotAge = stats.calendarSnapshotAgeMs === null ? "age unknown" : `age ${formatDuration(stats.calendarSnapshotAgeMs)}`;
+        const refreshLabel = stats.calendarRefreshMs === null ? "" : `, refreshed ${formatDuration(stats.calendarRefreshMs)}`;
+        statsText += ` | cal ${formatDuration(stats.calendarFetchMs)} (${stats.calendarCacheStatus}; ${snapshotAge}${refreshLabel}) + ${formatDuration(stats.calendarParseExpandMs)} | ${stats.calendarEvents}→${stats.calendarOccurrences}`;
       } else {
         statsText += " | calendar fallback";
       }
