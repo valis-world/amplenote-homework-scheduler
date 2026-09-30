@@ -14,6 +14,8 @@
     const LOOKAHEAD_DAYS = 35;
     const HOMEWORK_START_HOUR = 17;
     const HOMEWORK_START_MINUTE = 0;
+    const CALENDAR_FETCH_TIMEOUT_MS = 4000;
+    const FALLBACK_MARKER = " · fallback";
 
     // Day numbers: 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat, 7=Sun
     const timetable = {
@@ -46,7 +48,7 @@
       "PuG":                  ["pug", "pu+g", "politik", "gesellschaft", "politik und gesellschaft"],
       "Kunst":                ["kunst", "ku"],
       "Ethik":                ["ethik", "eth"],
-      "P-Seminar":            ["p-seminar", "p seminar", "pseminar", "ps"],
+      "P-Seminar":            ["p-seminar", "p seminar", "pseminar", "psemi", "psem", "ps"],
       "Sport":                ["sport", "spo", "sm"],
     };
 
@@ -209,6 +211,16 @@
       return homework ? { subject: match.subject, homework, subjectScore: match.score } : null;
     };
 
+    const parseFallbackTask = (task, now) => {
+      if (!task || !task.uuid || task.completedAt || task.dismissedAt) return null;
+      if (typeof task.startAt !== "number" || task.startAt <= Math.floor(now.getTime() / 1000)) return null;
+      const content = String(task.content || "").trim();
+      if (!content.endsWith(FALLBACK_MARKER)) return null;
+      const taskContent = content.slice(0, -FALLBACK_MARKER.length).trimEnd();
+      const parsed = parseHomeworkLine(taskContent);
+      return parsed ? { ...parsed, uuid: task.uuid, content: taskContent } : null;
+    };
+
     const extractText = (node) => {
       if (!node) return "";
       if (typeof node === "string") return node;
@@ -322,33 +334,45 @@
       if (!normalized) throw new Error(`No "${CALENDAR_PROXY_URL_SETTING_NAME}" setting configured`);
       if (!accessToken) throw new Error(`No "${CALENDAR_PROXY_TOKEN_SETTING_NAME}" setting configured`);
       const authorization = accessToken.toLowerCase().startsWith("bearer ") ? accessToken : `Bearer ${accessToken}`;
-      const response = await fetch(normalized, {
-        headers: {
-          Authorization: authorization,
-          Accept: "text/calendar, text/plain, */*",
-        },
-      });
-      if (!response.ok) {
-        let body = "";
-        try {
-          body = await response.text();
-        } catch (err) {
-          body = "";
+      const controller = typeof AbortController !== "undefined" ? new AbortController() : null;
+      const timeoutId = controller ? setTimeout(() => controller.abort(), CALENDAR_FETCH_TIMEOUT_MS) : null;
+      try {
+        const response = await fetch(normalized, {
+          headers: {
+            Authorization: authorization,
+            Accept: "text/calendar, text/plain, */*",
+          },
+          signal: controller ? controller.signal : undefined,
+        });
+        if (!response.ok) {
+          let body = "";
+          try {
+            body = await response.text();
+          } catch (err) {
+            body = "";
+          }
+          const detail = body ? `: ${truncate(body, 120)}` : "";
+          throw new Error(`HTTP ${response.status}${detail}`);
         }
-        const detail = body ? `: ${truncate(body, 120)}` : "";
-        throw new Error(`HTTP ${response.status}${detail}`);
-      }
 
-      const text = await response.text();
-      if (!text.includes("BEGIN:VCALENDAR")) throw new Error("Calendar proxy did not return an ICS calendar");
-      const fetchedAt = parseInt(response.headers.get("X-Calendar-Fetched-At") || "", 10);
-      const refreshMs = parseInt(response.headers.get("X-Calendar-Refresh-Ms") || "", 10);
-      return {
-        text,
-        cacheStatus: response.headers.get("X-Calendar-Cache") || "unknown",
-        fetchedAt: Number.isFinite(fetchedAt) ? fetchedAt : null,
-        refreshMs: Number.isFinite(refreshMs) ? refreshMs : null,
-      };
+        const text = await response.text();
+        if (!text.includes("BEGIN:VCALENDAR")) throw new Error("Calendar proxy did not return an ICS calendar");
+        const fetchedAt = parseInt(response.headers.get("X-Calendar-Fetched-At") || "", 10);
+        const refreshMs = parseInt(response.headers.get("X-Calendar-Refresh-Ms") || "", 10);
+        return {
+          text,
+          cacheStatus: response.headers.get("X-Calendar-Cache") || "unknown",
+          fetchedAt: Number.isFinite(fetchedAt) ? fetchedAt : null,
+          refreshMs: Number.isFinite(refreshMs) ? refreshMs : null,
+        };
+      } catch (err) {
+        if (controller && controller.signal.aborted) {
+          throw new Error(`Calendar proxy request timed out after ${CALENDAR_FETCH_TIMEOUT_MS / 1000}s`);
+        }
+        throw err;
+      } finally {
+        if (timeoutId !== null) clearTimeout(timeoutId);
+      }
     };
 
     const unfoldIcsLines = (icsText) => {
@@ -795,27 +819,51 @@
         });
       }
 
-      if (homeworkItems.length === 0) {
+      const now = new Date();
+      const warnings = [];
+      const fallbackTasks = [];
+      let fallbackTaskReadMs = null;
+      if (contentText.includes(FALLBACK_MARKER)) {
+        const fallbackTaskReadStartedAt = clockNow();
+        try {
+          const noteTasks = await app.getNoteTasks({ uuid: targetUUID });
+          for (const task of noteTasks || []) {
+            const fallbackTask = parseFallbackTask(task, now);
+            if (fallbackTask) fallbackTasks.push(fallbackTask);
+          }
+        } catch (err) {
+          warnings.push(`Could not inspect fallback tasks: ${err.message}`);
+        } finally {
+          fallbackTaskReadMs = clockNow() - fallbackTaskReadStartedAt;
+        }
+      }
+
+      if (homeworkItems.length === 0 && fallbackTasks.length === 0) {
         const reorderedText = reorderActiveTasks(contentText);
+        const warningText = warnings.length ? `\n\n⚠️ Warnings:\n${warnings.join("\n")}` : "";
         if (reorderedText !== contentText) {
           await app.replaceNoteContent({ uuid: targetUUID }, reorderedText);
-          await app.alert("🔎 No homework items found.\n\nReordered existing scheduled tasks.");
+          await app.alert(`🔎 No homework items found.\n\nReordered existing scheduled tasks.${warningText}`);
         } else {
-          await app.alert("🔎 No homework items found.");
+          await app.alert(`🔎 No homework items found.${warningText}`);
         }
         return;
       }
 
-      const now = new Date();
-      const warnings = [];
       const fallbackSubjects = new Set();
       const tasksCreated = [];
+      const tasksRescheduled = [];
       const linesToRemove = [];
-      const wantedSubjects = new Set(homeworkItems.map(item => item.subject));
+      const wantedSubjects = new Set([
+        ...homeworkItems.map(item => item.subject),
+        ...fallbackTasks.map(item => item.subject),
+      ]);
       const stats = {
         noteReadMs,
+        fallbackTaskReadMs,
         calendarFetchMs: null,
         calendarParseExpandMs: null,
+        taskWriteMs: null,
         calendarEvents: 0,
         calendarOccurrences: 0,
         calendarCacheStatus: "unknown",
@@ -825,10 +873,10 @@
       let calendarLessons = new Map();
       let calendarAvailable = false;
 
+      const calendarFetchStartedAt = clockNow();
       try {
         const proxyUrl = app.settings && app.settings[CALENDAR_PROXY_URL_SETTING_NAME];
         const proxyToken = app.settings && app.settings[CALENDAR_PROXY_TOKEN_SETTING_NAME];
-        const calendarFetchStartedAt = clockNow();
         const calendarFetch = await fetchCalendarText(proxyUrl, proxyToken);
         stats.calendarFetchMs = clockNow() - calendarFetchStartedAt;
         stats.calendarCacheStatus = calendarFetch.cacheStatus;
@@ -843,8 +891,34 @@
         stats.calendarParseExpandMs = clockNow() - calendarParseStartedAt;
         calendarAvailable = true;
       } catch (err) {
+        stats.calendarFetchMs = clockNow() - calendarFetchStartedAt;
         const origin = typeof window !== "undefined" && window.location ? window.location.origin : "unknown origin";
         warnings.push(`Calendar proxy warning from ${origin}: ${err.message}. Using timetable fallback where possible.`);
+      }
+
+      const taskWriteStartedAt = clockNow();
+      if (calendarAvailable) {
+        for (const task of fallbackTasks) {
+          const calendarLesson = calendarLessons.get(task.subject);
+          if (!calendarLesson) continue;
+
+          const taskDate = taskDateForLesson(calendarLesson.start, now);
+          const startAt = Math.floor(taskDate.getTime() / 1000);
+          const duration = subjectDurations[task.subject] || 30;
+          const endAt = startAt + duration * 60;
+
+          try {
+            const updated = await app.updateTask(task.uuid, { content: task.content, startAt, endAt });
+            if (!updated) {
+              warnings.push(`Could not reschedule ${task.subject}: the fallback task no longer exists.`);
+              continue;
+            }
+            tasksRescheduled.push(`- ${task.subject}: ${task.homework} · ${formatDateTime(taskDate)} · calendar`);
+          } catch (err) {
+            console.error(`Failed to reschedule ${task.subject}:`, err);
+            warnings.push(`Failed to reschedule ${task.subject}: ${err.message}`);
+          }
+        }
       }
 
       for (const item of homeworkItems) {
@@ -875,7 +949,8 @@
         const endAt = startAt + duration * 60;
 
         try {
-          await app.insertTask({ uuid: targetUUID }, { content: `${subject}: ${homework}`, startAt, endAt });
+          const taskContent = `${subject}: ${homework}${source === "timetable" ? FALLBACK_MARKER : ""}`;
+          await app.insertTask({ uuid: targetUUID }, { content: taskContent, startAt, endAt });
           const lessonScore = source === "calendar" && calendarLesson ? formatPercent(calendarLesson.subjectScore) : "--";
           const fallbackMarker = source === "timetable" ? " · fallback" : "";
           tasksCreated.push(`- ${subject}: ${homework} · ${formatDateTime(taskDate)} · ${duration}m · ${formatPercent(item.subjectScore)}/${lessonScore}${fallbackMarker}`);
@@ -885,6 +960,7 @@
           warnings.push(`Failed to create ${subject} task: ${err.message}`);
         }
       }
+      stats.taskWriteMs = clockNow() - taskWriteStartedAt;
 
       if (fallbackSubjects.size > 0) {
         warnings.push(`No matching calendar lesson found for: ${sortMessages([...fallbackSubjects]).join(", ")}. Used timetable fallback.`);
@@ -893,27 +969,36 @@
       const summaryParts = [];
       if (tasksCreated.length > 0) {
         summaryParts.push(`✅ Created ${tasksCreated.length} task(s):\n\n${tasksCreated.join("\n")}`);
-      } else {
+      }
+      if (tasksRescheduled.length > 0) {
+        summaryParts.push(`🗓️ Rescheduled ${tasksRescheduled.length} fallback task(s):\n\n${tasksRescheduled.join("\n")}`);
+      }
+      if (tasksCreated.length === 0 && tasksRescheduled.length === 0) {
         summaryParts.push("🔎 No tasks were created.");
       }
       const totalMs = clockNow() - runStartedAt;
       let statsText = `${formatDuration(totalMs)} total`;
+      statsText += ` | note read ${formatDuration(stats.noteReadMs)}`;
+      if (stats.fallbackTaskReadMs !== null) statsText += ` | fallback tasks ${formatDuration(stats.fallbackTaskReadMs)}`;
       if (calendarAvailable) {
         const snapshotAge = stats.calendarSnapshotAgeMs === null ? "age unknown" : `age ${formatDuration(stats.calendarSnapshotAgeMs)}`;
         const refreshLabel = stats.calendarRefreshMs === null ? "" : `, refreshed ${formatDuration(stats.calendarRefreshMs)}`;
         statsText += ` | cal ${formatDuration(stats.calendarFetchMs)} (${stats.calendarCacheStatus}; ${snapshotAge}${refreshLabel}) + ${formatDuration(stats.calendarParseExpandMs)} | ${stats.calendarEvents}→${stats.calendarOccurrences}`;
       } else {
-        statsText += " | calendar fallback";
+        statsText += ` | calendar fallback ${formatDuration(stats.calendarFetchMs)}`;
       }
+      statsText += ` | task writes ${formatDuration(stats.taskWriteMs)}`;
       summaryParts.push(`📊 Stats: ${statsText}`);
       if (warnings.length > 0) summaryParts.push(`⚠️ Warnings:\n${warnings.join("\n")}`);
       await app.alert(summaryParts.join("\n\n"));
 
-      const currentText = await getNoteText(targetUUID);
-      const cleanedText = removeCreatedHomeworkLines(currentText, linesToRemove);
-      const reorderedText = reorderActiveTasks(cleanedText);
-      if (reorderedText !== cleanedText || cleanedText !== currentText) {
-        await app.replaceNoteContent({ uuid: targetUUID }, reorderedText);
+      if (linesToRemove.length > 0 || tasksRescheduled.length > 0) {
+        const currentText = await getNoteText(targetUUID);
+        const cleanedText = removeCreatedHomeworkLines(currentText, linesToRemove);
+        const reorderedText = reorderActiveTasks(cleanedText);
+        if (reorderedText !== cleanedText || cleanedText !== currentText) {
+          await app.replaceNoteContent({ uuid: targetUUID }, reorderedText);
+        }
       }
 
     } catch (error) {

@@ -15,6 +15,7 @@ For each detected homework item, the plugin:
 - Skips cancelled lessons and lessons replaced by overlapping WebUntis update events.
 - Schedules the task for 17:00 on the day before that lesson.
 - Falls back to the hardcoded timetable when calendar lookup fails or misses that subject.
+- Marks fallback-scheduled tasks with a discreet ` · fallback` suffix. On a later run, open marked tasks are updated in place when the calendar supplies a matching lesson.
 - Shows a summary that says whether each task used `calendar` or `timetable`.
 
 Existing unchecked scheduled tasks in the note are sorted by their `startAt` timestamp after each run.
